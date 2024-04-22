@@ -1,0 +1,369 @@
+#################################################################################
+#################         Original GWAS Cleaning          ######################
+#################################################################################
+
+# view the head of the data
+zcat pts_eur_freeze2_overall.results.gz | head
+
+# checking that MAF ranges from 0.001 to 0.999
+zcat pts_eur_freeze2_overall.results.gz | awk '{print $7}' | head
+
+zcat pts_eur_freeze2_overall.results.gz | awk '{print $7}' | sort -g | head
+zcat pts_eur_freeze2_overall.results.gz | awk '{print $7}' | sort -g | tail
+
+# checking that INFO ranges from 0.3 to 1
+zcat pts_eur_freeze2_overall.results.gz | awk '{print $8}' | head
+
+zcat pts_eur_freeze2_overall.results.gz | awk '{print $8}' | sort -g | head
+zcat pts_eur_freeze2_overall.results.gz | awk '{print $8}' | sort -g | tail
+
+# correct for ambiguous SNPs
+zcat pts_eur_freeze2_overall.results.gz | awk '!( ($5=="A" && $6=="T") || ($5=="T" && $6=="A") || ($5=="G" && $6=="C") || ($5=="C" && $6=="G")) {print $0}' > ptsd_qc1
+
+# correct for duplicated SNPs
+awk '{print $2}' ptsd_qc1 |sort |uniq -d > ptsd.duplicated.snplist
+
+# remove all multi-allelic SNPs
+awk 'NR==FNR{a[$2];next}!($2 in a){print $0}' ptsd.duplicated.snplist ptsd_qc1 > ptsd.GWAS.QC
+
+wc -l ptsd.GWAS.QC # 9,766,175 SNPS after cleaning
+
+#################################################################################
+#############         Analysis using SNPs <= 1e-5          ##################
+#################################################################################
+
+# create .sh file using: nano test.sh
+# in test.sh, add the following lines including hashtags for the first five lines:
+
+#!/bin/bash
+#SBATCH --job-name=MR_1e-5_mb_PTSD1
+#SBATCH --time=24:00:00
+#SBATCH --mem 256G
+#SBATCH --output=MR_1e-5_mb_PTSD1.out
+
+module load R
+
+Rscript R_1e-5_mb_PTSD1.r
+
+# exit test.sh using control x
+# create .r file using: nano R_1e-5_mb_PTSD1.r
+# in .r file, copy all code below:
+
+#!/usr/bin/env Rscript
+
+options(echo=TRUE)
+print("In R now!") # just to test that R is working 
+
+## SCRIPT STARTS BELOW
+# load in different libraries 
+library(TwoSampleMR)
+library(mr.raps)
+library(MRPRESSO)
+library(MendelianRandomization)
+library(remotes)
+remotes::install_github("ropensci/rsnps") 
+library(ieugwasr)
+devtools::install_github("explodecomputer/genetics.binaRies")
+genetics.binaRies::get_plink_binary()
+
+# load the files
+mb <- list() # creates a empty list for all the microbial phenotypes
+filesPattern = "*.1e-5$" # files end in this
+listfile <- dir(pattern = filesPattern) # pulls needed files ending in .1e-5
+
+for (k in 1:length(listfile)) {
+outcome <- read_outcome_data(snps=clump_mb[[k]]$SNP, filename="/gpfs/gibbs/pi/huckins/pascoe/ptsd.GWAS.QC", sep="\t",snp_col="SNP" ,  pos_col="CHR", effect_allele_col = "A1", other_allele_col = "A2", beta_col = "OR", se_col = "SE",  pval_col = "P",ncase_col="Nca",  ncontrol_col="NCo")
+dat_harmonized[[k]]   <- harmonise_data(exposure_dat = clump_mb[[k]] ,outcome_dat = outcome, action=3)
+} # check names of column in .QC files to make sure they match, check separator 
+
+listfile
+# 213 files
+
+# for the exposure (Microbiome)
+# clumping to retain only independent SNPs, r2<0.1, window 10kb, 1000G phase 3 as LD (this could be achieved in twosampleMR package)
+
+clump_mb <- list()
+
+for (k in 1:length(listfile)) {
+    exp_format <- format_data(mb[[k]],  type = "exposure", phenotype_col ="bac", pos_col="chr:bp", snp_col = "rsID", other_allele_col = "ref.allele",effect_allele_col = "eff.allele", eaf_col="EAF", beta_col = "beta", se_col = "SE", z_col="Z.weightedSumZ", pval_col = "P", samplesize_col="N") 
+    exp_format_clump <- ld_clump( dplyr::tibble(rsid=exp_format$SNP, pval=exp_format$"pval.exposure", id=exp_format$"id.exposure"), plink_bin = genetics.binaRies::get_plink_binary(), bfile = "/gpfs/gibbs/pi/huckins/jx287/resources/MR_LD_reference/EUR")
+    clump_mb[[k]] <- exp_format[which(exp_format$SNP %in% exp_format_clump$rsid),] 
+}
+
+# check % of variance in exposure explained by the IV
+
+# when the exposure is a continuous trait: R-squared (R2) is a statistical measure that represents the proportion of the variance (=PVE)
+
+# F statistics = (r2*(N-1-k))/((1-r2)*k)
+# where r2 is variance explained, N is sample size, k is number of IVs
+
+IV_strength <- list()
+fstat <- data.frame(matrix(ncol = 4, nrow = length(listfile) ))
+colnames(fstat) <- c("id.exposure","exposure","mean_fstat","sum_fstat")
+
+for (k in 1:length(listfile)) {
+  dat  <- clump_mb[[k]]
+  SNP_count_IV <- dim(dat)[1]
+  dat$PVE.exposure <- (2*(dat$beta.exposure)*(dat$beta.exposure)*dat$eaf.exposure*(1-dat$eaf.exposure))/((2*(dat$beta.exposure)*(dat$beta.exposure)*dat$eaf.exposure*(1-dat$eaf.exposure))+ (dat$se.exposure)*(dat$se.exposure)*2*dat$samplesize.exposure*dat$eaf.exposure*(1-dat$eaf.exposure))
+  dat$F_stats <- (dat$PVE.exposure *(dat$samplesize.exposure-1-SNP_count_IV))/((1-dat$PVE.exposure)*SNP_count_IV)
+  fstat$"id.exposure"[k] <- dat$"id.exposure"[1]
+  fstat$"exposure"[k] <- dat$"exposure"[1]
+  fstat$mean_fstat[k] <- mean(dat$F_stats)
+  fstat$sum_fstat[k] <- sum(dat$F_stats)
+}
+
+fstat
+
+# load in the outcome
+dat_harmonized <- list()
+
+for (k in 1:length(listfile)) {
+outcome <- read_outcome_data(snps=clump_mb[[1]]$SNP, filename="/gpfs/gibbs/pi/huckins/pascoe/ptsd.GWAS.QC", sep="\t",snp_col="SNP" ,  pos_col="CHR", effect_allele_col = "A1", other_allele_col = "A2", beta_col = "OR", se_col = "SE",  pval_col = "P",ncase_col="Nca",  ncontrol_col="NCo")
+dat_harmonized[[1]]   <- harmonise_data(exposure_dat = clump_mb[[1]] ,outcome_dat = outcome, action=3)
+}
+ 
+# Steiger filtering to select valid genetic instruments
+
+dat_steiger <- list()
+
+for (k in 1:length(listfile)) {
+dat_steiger[[k]] <- steiger_filtering(dat_harmonized[[k]])
+snp_num_steiger <- dim(dat_steiger[[k]])[1]
+snp_num_harmonized <- dim(dat_harmonized[[k]])[1]
+diff <- snp_num_harmonized-snp_num_steiger
+if (diff ==0) next
+print(diff)
+}
+
+# how many SNPs per mb-PTSD association, after harmonization
+for (k in 1:length(listfile)) {
+ if (dim(dat_steiger[[k]])[1] > 5) next
+ print(dim(dat_steiger[[k]]))
+ } 
+
+for (k in 1:length(listfile)) {
+ if (dim(dat_steiger[[k]])[1] < 20) next
+ print(dim(dat_steiger[[k]]))
+ } 
+
+mr_bind <- list()
+mr_combine <- list()
+
+# when there are only 3 SNPs, MR PRESSO could not be run. Error message: Error in mr_presso(BetaOutcome = "beta.outcome", BetaExposure = "beta.exposure",  : esults' Not enough intrumental variables
+
+for (k in 1:length(listfile)){
+	if (dim(dat_steiger[[k]])[1] > 3) {
+set.seed(31415) # has to set seed so that the MR analysis output is the same every time it is run
+attach(dat_steiger[[k]])
+# five basic MR methods (IVW, Egger, weighted mode, simple mode, weighted median)
+mr_basic_5 <- mr(dat_steiger[[k]])
+# save the constant variables
+id.exposure <- mr_basic_5$id.exposure[1]
+id.outcome <- mr_basic_5$id.outcome[1]
+outcome <- mr_basic_5$outcome[1]
+exposure <- mr_basic_5$exposure[1]
+nsnp <- mr_basic_5$nsnp[1] }
+# heterogeneity
+mr_het <- mr_heterogeneity(dat_steiger[[k]])
+mr_het$method[which(mr_het$method=="MR Egger")] <- "MR_Egger_Q_Qdf_Qpval"
+mr_het$method[which(mr_het$method=="Inverse variance weighted")] <- "IVW_Q_Qdf_Qpval"
+colnames(mr_het)[colnames(mr_het)=="Q"] <- "b"
+colnames(mr_het)[colnames(mr_het)=="Q_df"] <- "se"
+colnames(mr_het)[colnames(mr_het)=="Q_pval"] <- "pval"
+mr_het$nsnp <- nsnp
+# pleiotropy test for the Egger intercept
+mr_intercept <- mr_pleiotropy_test(dat_steiger[[k]])
+mr_intercept$nsnp <- nsnp
+mr_intercept$method <- "egger_intercept"
+colnames(mr_intercept)[colnames(mr_intercept)=="egger_intercept"] <- "b"
+# MR.RAPS
+mr_rap <- mr.raps.all(beta.exposure, beta.outcome, se.exposure, se.outcome)
+mr_rap$pval[which(mr_rap$over.dispersion=="FALSE" & mr_rap$loss.function=="l2")] <- mr.raps(beta.exposure, beta.outcome, se.exposure, se.outcome,loss.function="l2", over.dispersion = FALSE)$beta.p.value
+mr_rap$pval[which(mr_rap$over.dispersion=="FALSE" & mr_rap$loss.function=="huber")] <- mr.raps(beta.exposure, beta.outcome, se.exposure, se.outcome,loss.function="huber", over.dispersion = FALSE)$beta.p.value
+mr_rap$pval[which(mr_rap$over.dispersion=="FALSE" & mr_rap$loss.function=="tukey")] <- mr.raps(beta.exposure, beta.outcome, se.exposure, se.outcome,loss.function="tukey", over.dispersion = FALSE)$beta.p.value
+mr_rap$pval[which(mr_rap$over.dispersion=="TRUE" & mr_rap$loss.function=="l2")] <- mr.raps(beta.exposure, beta.outcome, se.exposure, se.outcome,loss.function="l2", over.dispersion = TRUE)$beta.p.value
+mr_rap$pval[which(mr_rap$over.dispersion=="TRUE" & mr_rap$loss.function=="huber")] <- mr.raps(beta.exposure, beta.outcome, se.exposure, se.outcome,loss.function="huber", over.dispersion = TRUE)$beta.p.value
+mr_rap$pval[which(mr_rap$over.dispersion=="TRUE" & mr_rap$loss.function=="tukey")] <- mr.raps(beta.exposure, beta.outcome, se.exposure, se.outcome,loss.function="tukey", over.dispersion = TRUE)$beta.p.value
+mr_rap$id.exposure <- id.exposure
+mr_rap$id.outcome <- id.outcome
+mr_rap$outcome <- outcome
+mr_rap$exposure <- exposure
+mr_rap$nsnp <- nsnp
+mr_rap$method[which(mr_rap$over.dispersion=="FALSE" & mr_rap$loss.function=="l2")] <- "MR_RAPS_l2_wo_overdispersion"
+mr_rap$method[which(mr_rap$over.dispersion=="FALSE" & mr_rap$loss.function=="huber")] <- "MR_RAPS_huber_wo_overdispersion"
+mr_rap$method[which(mr_rap$over.dispersion=="FALSE" & mr_rap$loss.function=="tukey")] <- "MR_RAPS_tukey_wo_overdispersion"
+mr_rap$method[which(mr_rap$over.dispersion=="TRUE" & mr_rap$loss.function=="l2")] <- "MR_RAPS_l2_w_overdispersion"
+mr_rap$method[which(mr_rap$over.dispersion=="TRUE" & mr_rap$loss.function=="huber")] <- "MR_RAPS_huber_w_overdispersion"
+mr_rap$method[which(mr_rap$over.dispersion=="TRUE" & mr_rap$loss.function=="tukey")] <- "MR_RAPS_tukey_w_overdispersion"
+colnames(mr_rap)[colnames(mr_rap)=="beta.hat"] <- "b"
+colnames(mr_rap)[colnames(mr_rap)=="beta.se"] <- "se"
+drop <- c("over.dispersion","loss.function")
+mr_rap <- mr_rap[,!(names(mr_rap) %in% drop)]
+# MR PRESSO
+mr_presso <- mr_presso(BetaOutcome = "beta.outcome", BetaExposure = "beta.exposure", SdOutcome = "se.outcome", SdExposure = "se.exposure", OUTLIERtest = TRUE, DISTORTIONtest = TRUE, data = dat_steiger[[k]], NbDistribution = 1000,  SignifThreshold = 0.05)$'Main MR results'
+colnames(mr_presso)[colnames(mr_presso)=="Causal Estimate"] <- "b"
+colnames(mr_presso)[colnames(mr_presso)=="Sd"] <- "se"
+colnames(mr_presso)[colnames(mr_presso)=="P-value"] <- "pval"
+colnames(mr_presso)[colnames(mr_presso)=="MR Analysis"] <- "method"
+mr_presso$method[which(mr_presso$method=="Raw")] <- "MR_PRESSO_raw"
+mr_presso$method[which(mr_presso$method=="Outlier-corrected")] <- "MR_PRESSO_outlier_corrected"
+mr_presso$id.exposure <- id.exposure
+mr_presso$id.outcome <- id.outcome
+mr_presso$outcome <- outcome
+mr_presso$exposure <- exposure
+mr_presso$nsnp <- nsnp
+drop2 <- c("Exposure","T-stat")
+mr_presso <- mr_presso[,!(names(mr_presso) %in% drop2)]
+# debiased IVW
+output <- mr_divw(mr_input(bx = beta.exposure, bxse = se.exposure, by = beta.outcome, byse = se.outcome))
+mr_debiased_ivw <- data.frame(matrix(ncol = 9, nrow = 1))
+colnames(mr_debiased_ivw) <- c("id.exposure","id.outcome","outcome","exposure","method","nsnp","b","se","pval")
+mr_debiased_ivw$id.exposure <- id.exposure
+mr_debiased_ivw$id.outcome <- id.outcome
+mr_debiased_ivw$outcome <- outcome
+mr_debiased_ivw$exposure <- exposure
+mr_debiased_ivw$method <- "Debiased_IVW"
+mr_debiased_ivw$nsnp <- nsnp
+mr_debiased_ivw$b <- output@Estimate
+mr_debiased_ivw$se <- output@StdError
+mr_debiased_ivw$pval <- output@Pvalue
+# combine all MR results into one dataset
+mr_bind[[k]] <- rbind(mr_basic_5, mr_rap, mr_presso, mr_debiased_ivw, mr_intercept, mr_het)
+mr_combine[[k]] <- merge(mr_bind[[k]] , fstat, by=c("id.exposure","exposure"))
+	}
+	else if (dim(dat_steiger[[k]])[1] == 3) {
+set.seed(31415) # has to set seed so that the MR analysis output is the same every time it is run
+attach(dat_steiger[[k]])
+# five basic MR methods (IVW, Egger, weighted mode, simple mode, weighted median)
+mr_basic_5 <- mr(dat_steiger[[k]])
+# save the constant variables
+id.exposure <- mr_basic_5$id.exposure[1]
+id.outcome <- mr_basic_5$id.outcome[1]
+outcome <- mr_basic_5$outcome[1]
+exposure <- mr_basic_5$exposure[1]
+nsnp <- mr_basic_5$nsnp[1]
+# heterogeneity
+mr_het <- mr_heterogeneity(dat_steiger[[k]])
+mr_het$method[which(mr_het$method=="MR Egger")] <- "MR_Egger_Q_Qdf_Qpval"
+mr_het$method[which(mr_het$method=="Inverse variance weighted")] <- "IVW_Q_Qdf_Qpval"
+colnames(mr_het)[colnames(mr_het)=="Q"] <- "b"
+colnames(mr_het)[colnames(mr_het)=="Q_df"] <- "se"
+colnames(mr_het)[colnames(mr_het)=="Q_pval"] <- "pval"
+mr_het$nsnp <- nsnp
+# pleiotropy test for the Egger intercept
+mr_intercept <- mr_pleiotropy_test(dat_steiger[[k]])
+mr_intercept$nsnp <- nsnp
+mr_intercept$method <- "egger_intercept"
+colnames(mr_intercept)[colnames(mr_intercept)=="egger_intercept"] <- "b"
+# MR.RAPS
+mr_rap <- mr.raps.all(beta.exposure, beta.outcome, se.exposure, se.outcome)
+mr_rap$pval[which(mr_rap$over.dispersion=="FALSE" & mr_rap$loss.function=="l2")] <- mr.raps(beta.exposure, beta.outcome, se.exposure, se.outcome,loss.function="l2", over.dispersion = FALSE)$beta.p.value
+mr_rap$pval[which(mr_rap$over.dispersion=="FALSE" & mr_rap$loss.function=="huber")] <- mr.raps(beta.exposure, beta.outcome, se.exposure, se.outcome,loss.function="huber", over.dispersion = FALSE)$beta.p.value
+mr_rap$pval[which(mr_rap$over.dispersion=="FALSE" & mr_rap$loss.function=="tukey")] <- mr.raps(beta.exposure, beta.outcome, se.exposure, se.outcome,loss.function="tukey", over.dispersion = FALSE)$beta.p.value
+mr_rap$pval[which(mr_rap$over.dispersion=="TRUE" & mr_rap$loss.function=="l2")] <- mr.raps(beta.exposure, beta.outcome, se.exposure, se.outcome,loss.function="l2", over.dispersion = TRUE)$beta.p.value
+mr_rap$pval[which(mr_rap$over.dispersion=="TRUE" & mr_rap$loss.function=="huber")] <- mr.raps(beta.exposure, beta.outcome, se.exposure, se.outcome,loss.function="huber", over.dispersion = TRUE)$beta.p.value
+mr_rap$pval[which(mr_rap$over.dispersion=="TRUE" & mr_rap$loss.function=="tukey")] <- mr.raps(beta.exposure, beta.outcome, se.exposure, se.outcome,loss.function="tukey", over.dispersion = TRUE)$beta.p.value
+mr_rap$id.exposure <- id.exposure
+mr_rap$id.outcome <- id.outcome
+mr_rap$outcome <- outcome
+mr_rap$exposure <- exposure
+mr_rap$nsnp <- nsnp
+mr_rap$method[which(mr_rap$over.dispersion=="FALSE" & mr_rap$loss.function=="l2")] <- "MR_RAPS_l2_wo_overdispersion"
+mr_rap$method[which(mr_rap$over.dispersion=="FALSE" & mr_rap$loss.function=="huber")] <- "MR_RAPS_huber_wo_overdispersion"
+mr_rap$method[which(mr_rap$over.dispersion=="FALSE" & mr_rap$loss.function=="tukey")] <- "MR_RAPS_tukey_wo_overdispersion"
+mr_rap$method[which(mr_rap$over.dispersion=="TRUE" & mr_rap$loss.function=="l2")] <- "MR_RAPS_l2_w_overdispersion"
+mr_rap$method[which(mr_rap$over.dispersion=="TRUE" & mr_rap$loss.function=="huber")] <- "MR_RAPS_huber_w_overdispersion"
+mr_rap$method[which(mr_rap$over.dispersion=="TRUE" & mr_rap$loss.function=="tukey")] <- "MR_RAPS_tukey_w_overdispersion"
+colnames(mr_rap)[colnames(mr_rap)=="beta.hat"] <- "b"
+colnames(mr_rap)[colnames(mr_rap)=="beta.se"] <- "se"
+drop <- c("over.dispersion","loss.function")
+mr_rap <- mr_rap[,!(names(mr_rap) %in% drop)]
+# debiased IVW
+output <- mr_divw(mr_input(bx = beta.exposure, bxse = se.exposure, by = beta.outcome, byse = se.outcome))
+mr_debiased_ivw <- data.frame(matrix(ncol = 9, nrow = 1))
+colnames(mr_debiased_ivw) <- c("id.exposure","id.outcome","outcome","exposure","method","nsnp","b","se","pval")
+mr_debiased_ivw$id.exposure <- id.exposure
+mr_debiased_ivw$id.outcome <- id.outcome
+mr_debiased_ivw$outcome <- outcome
+mr_debiased_ivw$exposure <- exposure
+mr_debiased_ivw$method <- "Debiased_IVW"
+mr_debiased_ivw$nsnp <- nsnp
+mr_debiased_ivw$b <- output@Estimate
+mr_debiased_ivw$se <- output@StdError
+mr_debiased_ivw$pval <- output@Pvalue
+# combine all MR results into one dataset
+mr_bind[[k]] <- rbind(mr_basic_5, mr_rap, mr_debiased_ivw, mr_intercept, mr_het)	
+mr_combine[[k]] <- merge(mr_bind[[k]] , fstat, by=c("id.exposure","exposure"))
+	}
+}
+
+# combine the list into one dataset (for all analyses)
+library(data.table)
+mr_combine_all <- as.data.frame(rbindlist(mr_combine)) 
+mr_combine_all$method <- gsub(" ", "_", mr_combine_all$method)
+write.table(mr_combine_all, "mr_combine_all_mb_PTSD_1e-5", quote=F, row.names=F, sep="\t")
+
+library(data.table)
+broad_dat <- as.data.frame(fread("mr_combine_all_mb_PTSD_1e-5",head=T))
+
+broad_dat$p_thres <- "1e-5"
+
+# remove non-MR estimates
+dat_MR <- broad_dat[which(! broad_dat$method %in% c("Simple_mode","egger_intercept","MR_Egger_Q_Qdf_Qpval","IVW_Q_Qdf_Qpval")),] 
+
+ivw_nom <- dat_MR[which(dat_MR$pval <0.05 & dat_MR$method=="Inverse_variance_weighted"),]
+ivw_nom[order(ivw_nom$exposure),]
+
+count <- as.data.frame(table(ivw_nom$exposure))
+sig_taxa_mb_PTSD <- count[which(count$Freq==2),"Var1"]
+
+# break it down into different levels (e.g., phylum, order)
+library(tidyr)
+dat_MR <- dat_MR %>% separate(exposure, c("Type", NA),remove = FALSE)
+
+table(dat_MR$Type)
+
+phylum_MR <- dat_MR[which(dat_MR$Type =="phylum"),]
+class_MR  <- dat_MR[which(dat_MR$Type =="class"),]
+order_MR  <- dat_MR[which(dat_MR$Type =="order"),]
+family_MR <- dat_MR[which(dat_MR$Type =="family"),]
+genus_MR  <- dat_MR[which(dat_MR$Type =="genus"),]
+alphadiv_MR <- dat_MR[which(dat_MR$Type %in% c("shannon","simpson")),]
+
+dim(phylum_MR) 
+dim(class_MR) 
+dim(order_MR) 
+dim(family_MR) 
+dim(genus_MR) 
+dim(alphadiv_MR) 
+
+phylum_MR$p_fdr   <- p.adjust(phylum_MR$"pval",   method = "fdr")
+class_MR$p_fdr    <- p.adjust(class_MR$"pval",    method = "fdr")
+order_MR$p_fdr    <- p.adjust(order_MR$"pval",    method = "fdr")
+family_MR$p_fdr   <- p.adjust(family_MR$"pval",   method = "fdr")
+genus_MR$p_fdr    <- p.adjust(genus_MR$"pval",    method = "fdr")
+alphadiv_MR$p_fdr <- p.adjust(alphadiv_MR$"pval", method = "fdr")
+
+summary(phylum_MR$p_fdr)
+summary(class_MR$p_fdr)
+summary(order_MR$p_fdr)
+summary(family_MR$p_fdr)
+summary(genus_MR$p_fdr)
+summary(alphadiv_MR$p_fdr)
+
+# below is an example, change genuses to match significant ones found in summaries 
+
+hits <- broad_dat[which(broad_dat$exposure %in% c("genus.Paraprevotella.id.962","genus.Roseburia.id.2012")),]
+hits[order(hits$exposure),]
+
+genus_MR %>% filter(exposure %in% "genus.Roseburia.id.2012")  %>% arrange(pval)
+genus_MR %>% filter(exposure %in% "genus.Roseburia.id.2012")  %>% arrange(b)
+genus_MR %>% filter(exposure %in% "genus.Roseburia.id.2012")  %>% filter(method %in% "Inverse_variance_weighted")
+
+genus_MR %>% filter(exposure %in% "genus.Paraprevotella.id.962")  %>% arrange(pval)
+genus_MR %>% filter(exposure %in% "genus.Paraprevotella.id.962")  %>% arrange(b)
+genus_MR %>% filter(exposure %in% "genus.Paraprevotella.id.962")  %>% filter(method %in% "Inverse_variance_weighted")
+
+# exit .r file
+# submit job using: sbatch test.sh
+# check job status with: squeue -u "username"
